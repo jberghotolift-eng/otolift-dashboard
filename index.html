@@ -244,7 +244,7 @@
     <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
       <div>
         <h2>Conversieratio door de tijd</h2>
-        <p class="sub">Per kanaal per maand, o.b.v. maand waarin de lead binnenkwam (first-touch). Maanden met weinig leads worden overgeslagen.</p>
+        <p class="sub">Lijnen = conversieratio per kanaal per maand (first-touch). Grijze staven = totaal leads van de geselecteerde kanalen, op de rechter-as — zo zie je of volume stijgt terwijl de ratio daalt. Maanden met weinig leads worden overgeslagen.</p>
       </div>
       <div class="seg" id="trendMetricSeg">
         <button data-metric="visit" class="active">Lead → Visit</button>
@@ -889,16 +889,19 @@ function conversionTrend(metric, minLeads){
   });
   const months = [...monthsSet].sort();
   const leadsByCh = {};
-  const series = {};
+  const series = {};      // channel -> [ratio|null per month]
+  const volByChMonth = {};// channel -> {ym: leads}
   Object.keys(acc).forEach(ch=>{
     leadsByCh[ch] = Object.values(acc[ch]).reduce((s,x)=>s+x.leads,0);
+    volByChMonth[ch] = {};
     series[ch] = months.map(ym=>{
       const c = acc[ch][ym];
+      volByChMonth[ch][ym] = c ? c.leads : 0;
       if(!c || c.leads < minLeads) return null;   // te weinig data -> gat in lijn
       return +(c.hit / c.leads * 100).toFixed(1);
     });
   });
-  return {months, series, leadsByCh};
+  return {months, series, leadsByCh, volByChMonth};
 }
 
 function volumeSeries(){
@@ -1031,7 +1034,7 @@ function renderConvTrend(){
   if(!ctx) return;
   if(charts.convTrend) charts.convTrend.destroy();
   const metric = state.trendMetric;   // 'visit' | 'order'
-  const {months, series, leadsByCh} = conversionTrend(metric);
+  const {months, series, leadsByCh, volByChMonth} = conversionTrend(metric);
   // default selected channels: top 5 by lead volume, first render only
   if(state.trendChannels===null){
     state.trendChannels = Object.entries(leadsByCh).sort((a,b)=>b[1]-a[1]).slice(0,5).map(x=>x[0]);
@@ -1040,7 +1043,7 @@ function renderConvTrend(){
   const chipWrap=document.getElementById('trendChannelChips');
   if(chipWrap){
     const allCh = Object.entries(leadsByCh).sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
-    chipWrap.innerHTML = allCh.map((ch,idx)=>{
+    chipWrap.innerHTML = allCh.map((ch)=>{
       const on = state.trendChannels.includes(ch);
       return `<button class="trend-chip ${on?'on':''}" data-ch="${ch.replace(/"/g,'&quot;')}">
         <i style="background:${on?colorFor(state.trendChannels.indexOf(ch)):'#c8c8ce'}"></i>${ch}</button>`;
@@ -1052,24 +1055,38 @@ function renderConvTrend(){
       renderConvTrend();
     }));
   }
-  const datasets = state.trendChannels.map((ch,i)=>({
-    label:ch, data:series[ch]||months.map(()=>null),
+  // volume bars = summed leads of selected channels per month (context behind lines)
+  const volBars = months.map((ym,mi)=>
+    state.trendChannels.reduce((s,ch)=> s + ((volByChMonth[ch]&&volByChMonth[ch][ym])||0), 0)
+  );
+  const lineDatasets = state.trendChannels.map((ch,i)=>({
+    type:'line', label:ch, data:series[ch]||months.map(()=>null),
     borderColor:colorFor(i), backgroundColor:colorFor(i),
-    tension:.25, spanGaps:true, pointRadius:2.5, pointHoverRadius:5, borderWidth:2
+    tension:.25, spanGaps:true, pointRadius:2.5, pointHoverRadius:5, borderWidth:2,
+    yAxisID:'y', order:1
   }));
+  const barDataset = {
+    type:'bar', label:'Leads (geselecteerd)', data:volBars,
+    backgroundColor:'rgba(138,138,148,.20)', borderColor:'rgba(138,138,148,.20)',
+    yAxisID:'yVol', order:99
+  };
   charts.convTrend=new Chart(ctx,{
-    type:'line',
-    data:{labels:months, datasets},
+    data:{labels:months, datasets:[barDataset, ...lineDatasets]},
     options:{
       responsive:true,maintainAspectRatio:false,
       interaction:{mode:'index',intersect:false},
       plugins:{legend:{display:false},tooltip:{callbacks:{
-        label:c=>c.parsed.y==null?null:` ${c.dataset.label}: ${fmt1(c.parsed.y)}%`
+        label:c=>{
+          if(c.dataset.type==='bar') return ` Leads (samen): ${fmt(c.parsed.y)}`;
+          return c.parsed.y==null?null:` ${c.dataset.label}: ${fmt1(c.parsed.y)}%`;
+        }
       }}},
       scales:{
         x:{grid:{display:false},ticks:{font:{size:10},maxRotation:45,minRotation:45}},
-        y:{grid:{color:'#f0f0f3'},beginAtZero:true,ticks:{callback:v=>v+'%'},
-           title:{display:true,text:metric==='order'?'Lead → Order %':'Lead → Visit (R1) %',font:{size:11}}}
+        y:{position:'left',grid:{color:'#f0f0f3'},beginAtZero:true,ticks:{callback:v=>v+'%'},
+           title:{display:true,text:metric==='order'?'Lead → Order %':'Lead → Visit (R1) %',font:{size:11}}},
+        yVol:{position:'right',grid:{drawOnChartArea:false},beginAtZero:true,
+           title:{display:true,text:'Leads / maand',font:{size:11}}}
       }
     }
   });
