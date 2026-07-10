@@ -134,6 +134,13 @@
   .load-spinner{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--red);
     border-radius:50%;animation:spin .8s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+
+  .trend-chips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 14px}
+  .trend-chip{display:inline-flex;align-items:center;gap:6px;font-family:inherit;font-size:12px;
+    padding:5px 10px;border:1px solid var(--line);border-radius:20px;background:#fff;color:var(--ink-3);cursor:pointer}
+  .trend-chip.on{color:var(--ink);border-color:var(--ink-3)}
+  .trend-chip i{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .trend-chip:hover{border-color:var(--ink-3)}
 </style>
 </head>
 <body>
@@ -231,6 +238,21 @@
       </table>
     </div>
     <div class="note" id="costNote" style="border-left-color:var(--red)"></div>
+  </div>
+
+  <div class="card pad" style="margin-bottom:16px">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
+      <div>
+        <h2>Conversieratio door de tijd</h2>
+        <p class="sub">Per kanaal per maand, o.b.v. maand waarin de lead binnenkwam (first-touch). Maanden met weinig leads worden overgeslagen.</p>
+      </div>
+      <div class="seg" id="trendMetricSeg">
+        <button data-metric="visit" class="active">Lead → Visit</button>
+        <button data-metric="order">Lead → Order</button>
+      </div>
+    </div>
+    <div id="trendChannelChips" class="trend-chips"></div>
+    <div class="chart-wrap tall"><canvas id="convTrendChart"></canvas></div>
   </div>
 
   <div class="card pad" id="effCard" style="margin-bottom:16px">
@@ -628,7 +650,7 @@ let MI_TOTAL = 0;                    // total touchpoint count (for KPI foot)
 let COSTS = [];                      // {ym, channel, cost}
 let COSTS_UNMATCHED = [];            // {ym, cost} — offline/non-attributable
 let charts = {};
-let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1 };
+let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1, trendMetric: 'visit', trendChannels: null };
 
 const CERT_NAMES = ['exact','approx','single'];
 
@@ -847,6 +869,38 @@ function pathStats(){
   return {arr:arr.slice(0,9), totalMulti:leads.length};
 }
 
+// Monthly conversion per channel: {months:[...], series:{channel:[...]}, leadsByCh:{channel:total}}
+// metric = 'visit' (lead->R1) or 'order' (lead->order). Months with < minLeads are null (gap in line).
+function conversionTrend(metric, minLeads){
+  minLeads = minLeads || 15;
+  const leads = filteredLeads();
+  const acc = {};   // channel -> ym -> {leads,hit}
+  const monthsSet = new Set();
+  leads.forEach(r=>{
+    if(!r.first_touch_date) return;
+    const ym = r.first_touch_date.slice(0,7);
+    const ch = r.first_touch_channel || 'Onbekend';
+    monthsSet.add(ym);
+    acc[ch] = acc[ch] || {};
+    acc[ch][ym] = acc[ch][ym] || {leads:0, hit:0};
+    acc[ch][ym].leads++;
+    const hit = metric==='order' ? r.is_order : r.converted;
+    if(hit) acc[ch][ym].hit++;
+  });
+  const months = [...monthsSet].sort();
+  const leadsByCh = {};
+  const series = {};
+  Object.keys(acc).forEach(ch=>{
+    leadsByCh[ch] = Object.values(acc[ch]).reduce((s,x)=>s+x.leads,0);
+    series[ch] = months.map(ym=>{
+      const c = acc[ch][ym];
+      if(!c || c.leads < minLeads) return null;   // te weinig data -> gat in lijn
+      return +(c.hit / c.leads * 100).toFixed(1);
+    });
+  });
+  return {months, series, leadsByCh};
+}
+
 function volumeSeries(){
   const mi = filteredMiAgg();
   const dates = mi.map(r=>r.mi_date).filter(Boolean).sort();
@@ -968,6 +1022,55 @@ function renderVolumeChart(){
         title:{display:!!gran,text:gran==='month'?'per maand':gran==='week'?'per week':'per dag',font:{size:11,weight:'normal'},color:INK3,align:'end'}},
       scales:{x:{stacked:true,grid:{display:false},ticks:{font:{size:10},maxRotation:45,minRotation:0}},
               y:{stacked:true,grid:{color:'#f0f0f3'}}}
+    }
+  });
+}
+
+function renderConvTrend(){
+  const ctx=document.getElementById('convTrendChart');
+  if(!ctx) return;
+  if(charts.convTrend) charts.convTrend.destroy();
+  const metric = state.trendMetric;   // 'visit' | 'order'
+  const {months, series, leadsByCh} = conversionTrend(metric);
+  // default selected channels: top 5 by lead volume, first render only
+  if(state.trendChannels===null){
+    state.trendChannels = Object.entries(leadsByCh).sort((a,b)=>b[1]-a[1]).slice(0,5).map(x=>x[0]);
+  }
+  // build channel chips
+  const chipWrap=document.getElementById('trendChannelChips');
+  if(chipWrap){
+    const allCh = Object.entries(leadsByCh).sort((a,b)=>b[1]-a[1]).map(x=>x[0]);
+    chipWrap.innerHTML = allCh.map((ch,idx)=>{
+      const on = state.trendChannels.includes(ch);
+      return `<button class="trend-chip ${on?'on':''}" data-ch="${ch.replace(/"/g,'&quot;')}">
+        <i style="background:${on?colorFor(state.trendChannels.indexOf(ch)):'#c8c8ce'}"></i>${ch}</button>`;
+    }).join('');
+    chipWrap.querySelectorAll('.trend-chip').forEach(b=>b.addEventListener('click',()=>{
+      const ch=b.dataset.ch;
+      const i=state.trendChannels.indexOf(ch);
+      if(i>=0) state.trendChannels.splice(i,1); else state.trendChannels.push(ch);
+      renderConvTrend();
+    }));
+  }
+  const datasets = state.trendChannels.map((ch,i)=>({
+    label:ch, data:series[ch]||months.map(()=>null),
+    borderColor:colorFor(i), backgroundColor:colorFor(i),
+    tension:.25, spanGaps:true, pointRadius:2.5, pointHoverRadius:5, borderWidth:2
+  }));
+  charts.convTrend=new Chart(ctx,{
+    type:'line',
+    data:{labels:months, datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:c=>c.parsed.y==null?null:` ${c.dataset.label}: ${fmt1(c.parsed.y)}%`
+      }}},
+      scales:{
+        x:{grid:{display:false},ticks:{font:{size:10},maxRotation:45,minRotation:45}},
+        y:{grid:{color:'#f0f0f3'},beginAtZero:true,ticks:{callback:v=>v+'%'},
+           title:{display:true,text:metric==='order'?'Lead → Order %':'Lead → Visit (R1) %',font:{size:11}}}
+      }
     }
   });
 }
@@ -1145,7 +1248,7 @@ function renderPaths(){
 function renderAll(){
   document.getElementById('perfModelLabel').textContent = state.attr==='first'?'first-touch':'last-touch';
   document.querySelectorAll('.modelLabel').forEach(e=>e.textContent=state.attr==='first'?'first-touch':'last-touch');
-  renderKpis(); renderChannelChart(); renderVolumeChart(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderPaths();
+  renderKpis(); renderChannelChart(); renderVolumeChart(); renderConvTrend(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderPaths();
 }
 
 function allMiDates(){
@@ -1164,6 +1267,11 @@ function updateDataRange(){
 
 /* ================= Events ================= */
 function bindEvents(){
+  document.getElementById('trendMetricSeg').addEventListener('click',e=>{
+    if(e.target.tagName!=='BUTTON')return;
+    document.querySelectorAll('#trendMetricSeg button').forEach(b=>b.classList.remove('active'));
+    e.target.classList.add('active'); state.trendMetric=e.target.dataset.metric; renderConvTrend();
+  });
   document.getElementById('attrSeg').addEventListener('click',e=>{
     if(e.target.tagName!=='BUTTON')return;
     document.querySelectorAll('#attrSeg button').forEach(b=>b.classList.remove('active'));
