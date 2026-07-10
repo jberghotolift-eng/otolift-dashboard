@@ -284,7 +284,8 @@ const SHEET_ID = '1el5DWoRmRou6tfoxAddLrBLg_gZhfZSwxh8eB99P1uY';
 const TABS = {
   opps:  '866511917',    // Converted leads: Lead ID + Stage
   mi:    '1036422806',   // Marketing info data (grote export)
-  costs: '1186703796',   // Marketing kosten per kanaal
+  costs: '1186703796',   // Marketing kosten per kanaal (maand x campagne)
+  gads:  '1401284792',   // Google Ads kosten per campagne per dag (Date, Campaign name, Cost)
 };
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`;
 
@@ -317,9 +318,14 @@ function mapChannel(rawSource, campaign){
   }
   const key = normSource(rawSource);
   if(key==null) return 'Direct/Onbekend';
+  // Google split: Branded (campagne bevat 'branded') vs NB (al het overige Google)
+  const isGoogle = (CHANNEL_MAP[key]==='Google Ads') || key.includes('google');
+  if(isGoogle){
+    const camp = campaign!=null ? String(campaign).toLowerCase() : '';
+    return camp.includes('branded') ? 'Google Ads - Branded' : 'Google Ads - NB';
+  }
   if(CHANNEL_MAP[key]) return CHANNEL_MAP[key];
   if(key.includes('facebook')||key==='fb'||key==='ig') return 'Facebook Ads';
-  if(key.includes('google')) return 'Google Ads';
   if(key.includes('mail')||key.includes('email')||key.includes('nieuwsbrief')) return 'E-mail (CRM)';
   if(key.includes('dpg')||key.includes('dagblad')) return 'Print DPG';
   if(PRINT_OVERIG_TERMS.some(t=>key.includes(t))) return 'Print overig';
@@ -328,10 +334,10 @@ function mapChannel(rawSource, campaign){
 
 /* ---- Kosten-mapping (identiek aan build_costs.py) ---- */
 const COST_CAMPAIGN_TO_CHANNEL = {
-  'Google (NL)':'Google Ads','Bing (NL)':'Bing Ads','Facebook (NL)':'Facebook Ads',
+  'Bing (NL)':'Bing Ads','Facebook (NL)':'Facebook Ads',
   'DPG Performance (NL)':'Print DPG','Awin (NL)':'Affiliate',
 };
-const COST_SUBSTR = [['facebook','Facebook Ads'],['google','Google Ads'],['bing','Bing Ads'],['awin','Affiliate']];
+const COST_SUBSTR = [['facebook','Facebook Ads'],['bing','Bing Ads'],['awin','Affiliate']];
 const LABEL_TO_CHANNEL = { 'Television & Radio':'Telefoon (0800)' };
 const PRINT_LABELS = new Set(['Newspaper','Magazines']);
 const DPG_PAPER_HINTS = ['ad -','ad-','bn destem','brabants dagblad','dagblad van het noorden','gelderlander',
@@ -339,6 +345,9 @@ const DPG_PAPER_HINTS = ['ad -','ad-','bn destem','brabants dagblad','dagblad va
 function mapCostChannel(name, label){
   if(COST_CAMPAIGN_TO_CHANNEL[name]) return COST_CAMPAIGN_TO_CHANNEL[name];
   const low = String(name).toLowerCase();
+  // De lompe 'Google (NL)' regel negeren: Google-kosten komen uit de aparte
+  // per-campagne tab (gads), gesplitst in Branded/NB. Dubbeltelling voorkomen.
+  if(low.includes('google')) return null;
   for(const [sub,ch] of COST_SUBSTR) if(low.includes(sub)) return ch;
   if(label && LABEL_TO_CHANNEL[label]) return LABEL_TO_CHANNEL[label];
   if(PRINT_LABELS.has(label)){
@@ -346,6 +355,13 @@ function mapCostChannel(name, label){
     return 'Print overig';
   }
   return null;
+}
+
+// Google-campagne -> Branded/NB, exact dezelfde regel als aan de leadkant:
+// naam bevat 'branded' (incl. Semi-Branded) => Branded, anders NB.
+function googleChannelForCampaign(campaign){
+  return String(campaign||'').toLowerCase().includes('branded')
+    ? 'Google Ads - Branded' : 'Google Ads - NB';
 }
 
 /* ---- Datum-parsing: robuust voor Excel-serieel, ISO, en Europese dd/mm/yyyy.
@@ -421,7 +437,7 @@ const MONTHS = ['January','February','March','April','May','June','July','August
    { leadRows, channels, miAgg, miTotal, costs } — hetzelfde formaat dat het
    dashboard verwacht.
    ========================================================================== */
-function processRawData(miRaw, oppRaw, costRaw){
+function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
   // ---------- 1. Orders ----------
   const oppHdr = findHeaderRow(oppRaw, ['Lead ID','Stage']);
   const oppCols = oppRaw[oppHdr].map(c=>String(c).trim());
@@ -527,6 +543,24 @@ function processRawData(miRaw, oppRaw, costRaw){
       else { unmatchedMap[ym]=(unmatchedMap[ym]||0)+cost; }
     });
   }
+  // ---------- 3b. Google Ads kosten per campagne per dag (aparte tab) ----------
+  // Splitst Google in Branded/NB volgens dezelfde regel als de leads.
+  if(gadsRaw && gadsRaw.length){
+    const gHdr = findHeaderRow(gadsRaw, ['Date','Campaign name']);
+    const gCols = gadsRaw[gHdr].map(c=>String(c).trim());
+    const gDate=gCols.indexOf('Date'), gCamp=gCols.indexOf('Campaign name'), gCost=gCols.indexOf('Cost');
+    if(gDate>=0 && gCamp>=0 && gCost>=0){
+      for(let r=gHdr+1;r<gadsRaw.length;r++){
+        const row=gadsRaw[r]; if(!row||row.length<=Math.max(gDate,gCamp,gCost)) continue;
+        const d=parseDate(row[gDate]); if(!d) continue;
+        const cost=toNumber(row[gCost]); if(cost<=0) continue;
+        const ym=d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');
+        const ch=googleChannelForCampaign(row[gCamp]);
+        const key=ym+'|'+ch; costMap[key]=(costMap[key]||0)+cost;
+      }
+    }
+  }
+
   const costs = Object.entries(costMap).map(([k,v])=>{const [ym,ch]=k.split('|');return {ym,channel:ch,cost:v};});
   const unmatched = Object.entries(unmatchedMap).map(([ym,v])=>({ym,cost:v}));
 
@@ -597,11 +631,11 @@ async function fetchTab(gid){
 async function loadFromSheet(){
   showStatus('Data ophalen uit Google Sheet…');
   try{
-    const [miRaw, oppRaw, costRaw] = await Promise.all([
-      fetchTab(TABS.mi), fetchTab(TABS.opps), fetchTab(TABS.costs)
+    const [miRaw, oppRaw, costRaw, gadsRaw] = await Promise.all([
+      fetchTab(TABS.mi), fetchTab(TABS.opps), fetchTab(TABS.costs), fetchTab(TABS.gads)
     ]);
     showStatus('Verwerken…');
-    hydrate(processRawData(miRaw, oppRaw, costRaw));
+    hydrate(processRawData(miRaw, oppRaw, costRaw, gadsRaw));
     hideStatus();
     setUpdated();
   }catch(err){
@@ -786,7 +820,9 @@ function volumeSeries(){
   // top channels by total touchpoint volume
   const volByCh={};
   mi.forEach(r=>{ volByCh[r.channel]=(volByCh[r.channel]||0)+r.n; });
-  const topChannels = Object.entries(volByCh).sort((a,b)=>b[1]-a[1]).slice(0,5).map(x=>x[0]);
+  let topChannels = Object.entries(volByCh).sort((a,b)=>b[1]-a[1]).slice(0,5).map(x=>x[0]);
+  // MQL altijd als eigen categorie tonen, ook als het buiten de top 5 valt
+  if(volByCh['MQL'] && !topChannels.includes('MQL')) topChannels.push('MQL');
   const buckets={};
   mi.forEach(r=>{
     if(!r.mi_date) return;
@@ -993,7 +1029,7 @@ function renderFunnelChart(){
       }}},
       scales:{
         x:{grid:{display:false},ticks:{maxRotation:45,minRotation:45,font:{size:11}}},
-        y:{grid:{color:'#f0f0f3'},type:'logarithmic',title:{display:true,text:'Aantal (log schaal)',font:{size:11}}}
+        y:{grid:{color:'#f0f0f3'},beginAtZero:true,title:{display:true,text:'Aantal',font:{size:11}}}
       }
     }
   });
