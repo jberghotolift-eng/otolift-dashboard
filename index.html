@@ -456,6 +456,7 @@ function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
   const col = name => miCols.indexOf(name);
   const cId=col('Marketing Information: ID'), cLead=col('Lead: Lead ID'),
         cMiDate=col('Marketing Information: Created Date'),
+        cLeadDate=col('Lead: Create Date Time'),
         cSource=col('pi utm source'), cCampaign=col('pi utm campaign'),
         cStatus=col('Lead: Lead Status'), cConv=col('Lead: Converted'),
         cAdcall=col('Adcalls ID');
@@ -468,15 +469,43 @@ function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
     const status=String(row[cStatus]||'').trim().toLowerCase();
     if(status==='not qualified') continue; // fake leads
     const miDate=parseDate(row[cMiDate]);
+    const leadDate=cLeadDate>=0 ? parseDate(row[cLeadDate]) : null;
+    // gap in dagen: MI-datum minus lead-aanmaakdatum
+    const gap = (miDate && leadDate) ? Math.round((miDate - leadDate)/86400000) : null;
     recs.push({
       miId: String(row[cId]||'').trim(),
       lead,
       miDate,
+      miDay: miDate ? ymd(miDate) : null,
+      gap,
       channel: mapChannel(row[cSource], row[cCampaign]),
       type: (row[cAdcall]!=null && String(row[cAdcall]).trim()!=='') ? 'Call' : 'Webform',
       converted: ['true','1','waar'].includes(String(row[cConv]||'').trim().toLowerCase()),
     });
   }
+
+  // ---- Backfill / bulk-import detectie ----
+  // Een MI-record is een backfill-artefact als het een grote gap heeft (MI-datum
+  // ver ná lead-aanmaak) ÉN op een MI-dag valt die massaal zulke records bevat.
+  // Zo worden bulk-imports gevangen zonder verspreide, legitieme late touchpoints
+  // (iemand die maanden later opnieuw belt) weg te gooien.
+  const GAP_DAYS = 60, DAY_MIN_RECORDS = 200, DAY_HIGHGAP_SHARE = 0.5;
+  const dayStats = {};
+  recs.forEach(r=>{
+    if(!r.miDay) return;
+    const s = dayStats[r.miDay] || (dayStats[r.miDay]={total:0, high:0});
+    s.total++; if(r.gap!=null && r.gap>GAP_DAYS) s.high++;
+  });
+  const bulkDays = new Set(Object.entries(dayStats)
+    .filter(([,s])=> s.total>DAY_MIN_RECORDS && (s.high/s.total)>DAY_HIGHGAP_SHARE)
+    .map(([d])=>d));
+  let backfillRemoved = 0;
+  const recsClean = recs.filter(r=>{
+    const isBackfill = r.gap!=null && r.gap>GAP_DAYS && bulkDays.has(r.miDay);
+    if(isBackfill) backfillRemoved++;
+    return !isBackfill;
+  });
+  recs.length = 0; Array.prototype.push.apply(recs, recsClean);
 
   // sorteren per lead: datum, dan MI-ID (intra-dag tie-breaker)
   recs.sort((a,b)=>{
@@ -567,7 +596,7 @@ function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
   // kanalenlijst
   const channels=[...new Set([...leadRows.map(l=>l.ftc),...leadRows.map(l=>l.ltc),...miAgg.map(m=>m.channel)])].sort();
 
-  return { leadRows, channels, miAgg, miTotal, costs, unmatched };
+  return { leadRows, channels, miAgg, miTotal, costs, unmatched, backfillRemoved };
 }
 
 </script>
