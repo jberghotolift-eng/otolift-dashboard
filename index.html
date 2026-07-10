@@ -255,6 +255,13 @@
     <div class="chart-wrap tall"><canvas id="convTrendChart"></canvas></div>
   </div>
 
+  <div class="card pad" id="cpoTrendCard" style="margin-bottom:16px">
+    <h2>Kosten per order (CPO) door de tijd</h2>
+    <p class="sub">Lijnen = CPO per kanaal per maand (kosten van de maand / orders van leads uit die maand, first-touch). Grijze staven = totaal orders van de geselecteerde kanalen. De <b style="color:var(--red)">rood gearceerde</b> laatste maanden zijn nog niet volgroeid — kosten zijn gemaakt maar orders komen vaak later binnen, dus CPO oogt daar kunstmatig hoog.</p>
+    <div id="cpoChannelChips" class="trend-chips"></div>
+    <div class="chart-wrap tall"><canvas id="cpoTrendChart"></canvas></div>
+  </div>
+
   <div class="card pad" id="effCard" style="margin-bottom:16px">
     <h2>Kosten-efficiëntie per kanaal</h2>
     <p class="sub">Volume (leads) tegen kosten per order (of per R1 als er geen orderdata is). Rechtsonder = veel volume én efficiënt. Alleen kanalen met kostendata, op first-touch.</p>
@@ -335,10 +342,14 @@ function normSource(v){
   return String(v).trim().toLowerCase().replace(/[_-]/g,' ').replace(/\s+/g,' ');
 }
 function mapChannel(rawSource, campaign){
+  const campRaw = campaign!=null ? String(campaign) : '';
   if(campaign!=null){
-    const ck = String(campaign).trim().toLowerCase().replace(/\s+/g,' ');
+    const ck = campRaw.trim().toLowerCase().replace(/\s+/g,' ');
     if(CAMPAIGN_OVERRIDE[ck]) return CAMPAIGN_OVERRIDE[ck];
   }
+  // Bamboo Leads: campagnenaam bevat altijd 'Bamboo Leads'. Vóór de Google-check,
+  // want een enkele Bamboo-lead heeft source 'Google Ad'.
+  if(campRaw.toLowerCase().includes('bamboo leads')) return 'Bamboo Leads';
   const key = normSource(rawSource);
   if(key==null) return 'Direct/Onbekend';
   // Google split: Branded (campagne bevat 'branded') vs NB (al het overige Google)
@@ -359,6 +370,7 @@ function mapChannel(rawSource, campaign){
 const COST_CAMPAIGN_TO_CHANNEL = {
   'Bing (NL)':'Bing Ads',
   'DPG Performance (NL)':'Print DPG','Awin (NL)':'Affiliate',
+  'Trapliftenvergelijken (NL)':'Bamboo Leads',
 };
 const COST_SUBSTR = [['bing','Bing Ads'],['awin','Affiliate']];
 const LABEL_TO_CHANNEL = { 'Television & Radio':'Telefoon (0800)' };
@@ -650,7 +662,7 @@ let MI_TOTAL = 0;                    // total touchpoint count (for KPI foot)
 let COSTS = [];                      // {ym, channel, cost}
 let COSTS_UNMATCHED = [];            // {ym, cost} — offline/non-attributable
 let charts = {};
-let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1, trendMetric: 'visit', trendChannels: null };
+let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1, trendMetric: 'visit', trendChannels: null, cpoChannels: null };
 
 const CERT_NAMES = ['exact','approx','single'];
 
@@ -869,7 +881,49 @@ function pathStats(){
   return {arr:arr.slice(0,9), totalMulti:leads.length};
 }
 
-// Monthly conversion per channel: {months:[...], series:{channel:[...]}, leadsByCh:{channel:total}}
+// Monthly CPO per channel: cost(month) / orders(leads whose first-touch month = that month).
+// Returns {months, series:{ch:[cpo|null]}, costByCh, volByChMonth(orders)}.
+// Months without cost OR without orders yield null (gap). Recent immature months
+// flagged via maturityCut (last N months where orders are still landing).
+function cpoTrend(minOrders){
+  minOrders = minOrders || 3;
+  const leads = filteredLeads();
+  const ordAcc = {};   // ch -> ym -> orders
+  const monthsSet = new Set();
+  leads.forEach(r=>{
+    if(!r.first_touch_date) return;
+    const ym = r.first_touch_date.slice(0,7);
+    const ch = r.first_touch_channel || 'Onbekend';
+    monthsSet.add(ym);
+    ordAcc[ch] = ordAcc[ch] || {};
+    ordAcc[ch][ym] = ordAcc[ch][ym] || 0;
+    if(r.is_order) ordAcc[ch][ym]++;
+  });
+  // cost per channel per month (also defines month range)
+  const costAcc = {};
+  COSTS.forEach(c=>{
+    if(!ymInRange(c.ym)) return;
+    monthsSet.add(c.ym);
+    costAcc[c.channel] = costAcc[c.channel] || {};
+    costAcc[c.channel][c.ym] = (costAcc[c.channel][c.ym]||0) + c.cost;
+  });
+  const months = [...monthsSet].sort();
+  const channels = [...new Set([...Object.keys(ordAcc), ...Object.keys(costAcc)])];
+  const series = {}, ordersByChMonth = {}, costByCh = {};
+  channels.forEach(ch=>{
+    ordersByChMonth[ch] = {};
+    costByCh[ch] = 0;
+    series[ch] = months.map(ym=>{
+      const o = (ordAcc[ch] && ordAcc[ch][ym]) || 0;
+      const c = (costAcc[ch] && costAcc[ch][ym]) || 0;
+      ordersByChMonth[ch][ym] = o;
+      costByCh[ch] += c;
+      if(c<=0 || o<minOrders) return null;   // geen kosten of te weinig orders -> gat
+      return Math.round(c / o);
+    });
+  });
+  return {months, series, ordersByChMonth, costByCh};
+}
 // metric = 'visit' (lead->R1) or 'order' (lead->order). Months with < minLeads are null (gap in line).
 function conversionTrend(metric, minLeads){
   minLeads = minLeads || 15;
@@ -1092,6 +1146,83 @@ function renderConvTrend(){
   });
 }
 
+function renderCpoTrend(){
+  const ctx=document.getElementById('cpoTrendChart');
+  if(!ctx) return;
+  if(charts.cpoTrend) charts.cpoTrend.destroy();
+  if(COSTS.length===0){ const card=document.getElementById('cpoTrendCard'); if(card)card.style.display='none'; return; }
+  const {months, series, ordersByChMonth, costByCh} = cpoTrend();
+  // only channels that actually have cost data
+  const costedChannels = Object.keys(costByCh).filter(ch=>costByCh[ch]>0)
+    .sort((a,b)=>costByCh[b]-costByCh[a]);
+  if(state.cpoChannels===null){
+    state.cpoChannels = costedChannels.slice(0,4);
+  }
+  // chips
+  const chipWrap=document.getElementById('cpoChannelChips');
+  if(chipWrap){
+    chipWrap.innerHTML = costedChannels.map((ch)=>{
+      const on = state.cpoChannels.includes(ch);
+      return `<button class="trend-chip ${on?'on':''}" data-ch="${ch.replace(/"/g,'&quot;')}">
+        <i style="background:${on?colorFor(state.cpoChannels.indexOf(ch)):'#c8c8ce'}"></i>${ch}</button>`;
+    }).join('');
+    chipWrap.querySelectorAll('.trend-chip').forEach(b=>b.addEventListener('click',()=>{
+      const ch=b.dataset.ch;
+      const i=state.cpoChannels.indexOf(ch);
+      if(i>=0) state.cpoChannels.splice(i,1); else state.cpoChannels.push(ch);
+      renderCpoTrend();
+    }));
+  }
+  // order-volume bars = summed orders of selected channels per month
+  const orderBars = months.map(ym=>
+    state.cpoChannels.reduce((s,ch)=> s + ((ordersByChMonth[ch]&&ordersByChMonth[ch][ym])||0), 0)
+  );
+  const lineDatasets = state.cpoChannels.map((ch,i)=>({
+    type:'line', label:ch, data:series[ch]||months.map(()=>null),
+    borderColor:colorFor(i), backgroundColor:colorFor(i),
+    tension:.25, spanGaps:true, pointRadius:2.5, pointHoverRadius:5, borderWidth:2,
+    yAxisID:'y', order:1
+  }));
+  const barDataset = {
+    type:'bar', label:'Orders (geselecteerd)', data:orderBars,
+    backgroundColor:'rgba(138,138,148,.20)', borderColor:'rgba(138,138,148,.20)',
+    yAxisID:'yVol', order:99
+  };
+  // shade the last 2 months as "immature" (orders still landing)
+  const immatureFrom = months.length>2 ? months.length-2 : months.length;
+  const shadePlugin = {
+    id:'immatureShade',
+    beforeDraw(c){
+      if(months.length<3) return;
+      const xa=c.scales.x, ya=c.chartArea; if(!xa||!ya) return;
+      const x0=xa.getPixelForValue(immatureFrom-0.5);
+      c.ctx.save(); c.ctx.fillStyle='rgba(208,2,27,.05)';
+      c.ctx.fillRect(x0, ya.top, ya.right-x0, ya.bottom-ya.top); c.ctx.restore();
+    }
+  };
+  charts.cpoTrend=new Chart(ctx,{
+    data:{labels:months, datasets:[barDataset, ...lineDatasets]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      interaction:{mode:'index',intersect:false},
+      plugins:{legend:{display:false},tooltip:{callbacks:{
+        label:c=>{
+          if(c.dataset.type==='bar') return ` Orders (samen): ${fmt(c.parsed.y)}`;
+          return c.parsed.y==null?null:` ${c.dataset.label}: € ${fmt(c.parsed.y)}`;
+        }
+      }}},
+      scales:{
+        x:{grid:{display:false},ticks:{font:{size:10},maxRotation:45,minRotation:45}},
+        y:{position:'left',grid:{color:'#f0f0f3'},beginAtZero:true,ticks:{callback:v=>'€'+v},
+           title:{display:true,text:'Kosten per order (€)',font:{size:11}}},
+        yVol:{position:'right',grid:{drawOnChartArea:false},beginAtZero:true,
+           title:{display:true,text:'Orders / maand',font:{size:11}}}
+      }
+    },
+    plugins:[shadePlugin]
+  });
+}
+
 function renderFlChart(){
   const {chans,f,l}=firstLastCompare();
   const ctx=document.getElementById('flChart');
@@ -1265,7 +1396,7 @@ function renderPaths(){
 function renderAll(){
   document.getElementById('perfModelLabel').textContent = state.attr==='first'?'first-touch':'last-touch';
   document.querySelectorAll('.modelLabel').forEach(e=>e.textContent=state.attr==='first'?'first-touch':'last-touch');
-  renderKpis(); renderChannelChart(); renderVolumeChart(); renderConvTrend(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderPaths();
+  renderKpis(); renderChannelChart(); renderVolumeChart(); renderConvTrend(); renderCpoTrend(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderPaths();
 }
 
 function allMiDates(){
