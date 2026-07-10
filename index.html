@@ -285,7 +285,8 @@ const TABS = {
   opps:  '866511917',    // Converted leads: Lead ID + Stage
   mi:    '1036422806',   // Marketing info data (grote export)
   costs: '1186703796',   // Marketing kosten per kanaal (maand x campagne)
-  gads:  '1401284792',   // Google Ads kosten per campagne per dag (Date, Campaign name, Cost)
+  gads:  '1401284792',   // Google Ads kosten per campagne per dag
+  fbads: '325473010',    // Facebook Ads kosten per campagne per dag (Nuture Lane -> MQL)
 };
 const csvUrl = gid => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`;
 
@@ -334,10 +335,10 @@ function mapChannel(rawSource, campaign){
 
 /* ---- Kosten-mapping (identiek aan build_costs.py) ---- */
 const COST_CAMPAIGN_TO_CHANNEL = {
-  'Bing (NL)':'Bing Ads','Facebook (NL)':'Facebook Ads',
+  'Bing (NL)':'Bing Ads',
   'DPG Performance (NL)':'Print DPG','Awin (NL)':'Affiliate',
 };
-const COST_SUBSTR = [['facebook','Facebook Ads'],['bing','Bing Ads'],['awin','Affiliate']];
+const COST_SUBSTR = [['bing','Bing Ads'],['awin','Affiliate']];
 const LABEL_TO_CHANNEL = { 'Television & Radio':'Telefoon (0800)' };
 const PRINT_LABELS = new Set(['Newspaper','Magazines']);
 const DPG_PAPER_HINTS = ['ad -','ad-','bn destem','brabants dagblad','dagblad van het noorden','gelderlander',
@@ -345,9 +346,10 @@ const DPG_PAPER_HINTS = ['ad -','ad-','bn destem','brabants dagblad','dagblad va
 function mapCostChannel(name, label){
   if(COST_CAMPAIGN_TO_CHANNEL[name]) return COST_CAMPAIGN_TO_CHANNEL[name];
   const low = String(name).toLowerCase();
-  // De lompe 'Google (NL)' regel negeren: Google-kosten komen uit de aparte
-  // per-campagne tab (gads), gesplitst in Branded/NB. Dubbeltelling voorkomen.
-  if(low.includes('google')) return null;
+  // Google- en Facebook-kosten komen uit de aparte per-campagne tabs (gads/fbads),
+  // gesplitst in respectievelijk Branded/NB en Facebook/MQL. De lompe regels
+  // 'Google (NL)' en 'Facebook (NL)' hier negeren om dubbeltelling te voorkomen.
+  if(low.includes('google') || low.includes('facebook')) return null;
   for(const [sub,ch] of COST_SUBSTR) if(low.includes(sub)) return ch;
   if(label && LABEL_TO_CHANNEL[label]) return LABEL_TO_CHANNEL[label];
   if(PRINT_LABELS.has(label)){
@@ -362,6 +364,13 @@ function mapCostChannel(name, label){
 function googleChannelForCampaign(campaign){
   return String(campaign||'').toLowerCase().includes('branded')
     ? 'Google Ads - Branded' : 'Google Ads - NB';
+}
+
+// Facebook-campagne -> MQL of Facebook Ads, exact dezelfde regel als de
+// CAMPAIGN_OVERRIDE aan de leadkant: campagne 'NL - Nuture Lane' => MQL.
+function facebookChannelForCampaign(campaign){
+  const ck = String(campaign||'').trim().toLowerCase().replace(/\s+/g,' ');
+  return CAMPAIGN_OVERRIDE[ck] ? CAMPAIGN_OVERRIDE[ck] : 'Facebook Ads';
 }
 
 /* ---- Datum-parsing: robuust voor Excel-serieel, ISO, en Europese dd/mm/yyyy.
@@ -437,7 +446,7 @@ const MONTHS = ['January','February','March','April','May','June','July','August
    { leadRows, channels, miAgg, miTotal, costs } — hetzelfde formaat dat het
    dashboard verwacht.
    ========================================================================== */
-function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
+function processRawData(miRaw, oppRaw, costRaw, gadsRaw, fbadsRaw){
   // ---------- 1. Orders ----------
   const oppHdr = findHeaderRow(oppRaw, ['Lead ID','Stage']);
   const oppCols = oppRaw[oppHdr].map(c=>String(c).trim());
@@ -572,23 +581,27 @@ function processRawData(miRaw, oppRaw, costRaw, gadsRaw){
       else { unmatchedMap[ym]=(unmatchedMap[ym]||0)+cost; }
     });
   }
-  // ---------- 3b. Google Ads kosten per campagne per dag (aparte tab) ----------
-  // Splitst Google in Branded/NB volgens dezelfde regel als de leads.
-  if(gadsRaw && gadsRaw.length){
-    const gHdr = findHeaderRow(gadsRaw, ['Date','Campaign name']);
-    const gCols = gadsRaw[gHdr].map(c=>String(c).trim());
-    const gDate=gCols.indexOf('Date'), gCamp=gCols.indexOf('Campaign name'), gCost=gCols.indexOf('Cost');
-    if(gDate>=0 && gCamp>=0 && gCost>=0){
-      for(let r=gHdr+1;r<gadsRaw.length;r++){
-        const row=gadsRaw[r]; if(!row||row.length<=Math.max(gDate,gCamp,gCost)) continue;
-        const d=parseDate(row[gDate]); if(!d) continue;
-        const cost=toNumber(row[gCost]); if(cost<=0) continue;
-        const ym=d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');
-        const ch=googleChannelForCampaign(row[gCamp]);
-        const key=ym+'|'+ch; costMap[key]=(costMap[key]||0)+cost;
-      }
+  // ---------- 3b. Per-campagne dagkosten (aparte tabs: Google + Facebook) ----------
+  // Splitst Google in Branded/NB en Facebook in Facebook/MQL, volgens exact
+  // dezelfde regels als aan de leadkant. De lompe 'Google (NL)'/'Facebook (NL)'
+  // regels zijn hierboven al genegeerd om dubbeltelling te voorkomen.
+  function foldDailyCosts(raw, classify){
+    if(!raw || !raw.length) return;
+    const hdr = findHeaderRow(raw, ['Date','Campaign name']);
+    const cols = raw[hdr].map(c=>String(c).trim());
+    const di=cols.indexOf('Date'), ci=cols.indexOf('Campaign name'), coi=cols.indexOf('Cost');
+    if(di<0 || ci<0 || coi<0) return;
+    for(let r=hdr+1;r<raw.length;r++){
+      const row=raw[r]; if(!row||row.length<=Math.max(di,ci,coi)) continue;
+      const d=parseDate(row[di]); if(!d) continue;
+      const cost=toNumber(row[coi]); if(cost<=0) continue;
+      const ym=d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0');
+      const ch=classify(row[ci]);
+      const key=ym+'|'+ch; costMap[key]=(costMap[key]||0)+cost;
     }
   }
+  foldDailyCosts(gadsRaw, googleChannelForCampaign);
+  foldDailyCosts(fbadsRaw, facebookChannelForCampaign);
 
   const costs = Object.entries(costMap).map(([k,v])=>{const [ym,ch]=k.split('|');return {ym,channel:ch,cost:v};});
   const unmatched = Object.entries(unmatchedMap).map(([ym,v])=>({ym,cost:v}));
@@ -660,11 +673,11 @@ async function fetchTab(gid){
 async function loadFromSheet(){
   showStatus('Data ophalen uit Google Sheet…');
   try{
-    const [miRaw, oppRaw, costRaw, gadsRaw] = await Promise.all([
-      fetchTab(TABS.mi), fetchTab(TABS.opps), fetchTab(TABS.costs), fetchTab(TABS.gads)
+    const [miRaw, oppRaw, costRaw, gadsRaw, fbadsRaw] = await Promise.all([
+      fetchTab(TABS.mi), fetchTab(TABS.opps), fetchTab(TABS.costs), fetchTab(TABS.gads), fetchTab(TABS.fbads)
     ]);
     showStatus('Verwerken…');
-    hydrate(processRawData(miRaw, oppRaw, costRaw, gadsRaw));
+    hydrate(processRawData(miRaw, oppRaw, costRaw, gadsRaw, fbadsRaw));
     hideStatus();
     setUpdated();
   }catch(err){
