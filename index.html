@@ -221,7 +221,7 @@
 
   <div class="card pad" style="margin-bottom:16px">
     <h2>Kanaaltabel</h2>
-    <p class="sub">Volledige funnel: lead → R1 visit → order. Kosten/lead, /R1 en /order alleen op <b>first-touch</b> en voor kanalen met kostendata.</p>
+    <p class="sub">Volledige funnel: lead → R1 visit → order. Kosten/R1 en /order worden getoond voor kanalen met kostendata; ze volgen het gekozen attributiemodel.</p>
     <div style="overflow-x:auto">
       <table id="channelTable">
         <thead><tr>
@@ -264,7 +264,7 @@
 
   <div class="card pad" id="effCard" style="margin-bottom:16px">
     <h2>Kosten-efficiëntie per kanaal</h2>
-    <p class="sub">Volume (leads) tegen kosten per order (of per R1 als er geen orderdata is). Rechtsonder = veel volume én efficiënt. Alleen kanalen met kostendata, op first-touch.</p>
+    <p class="sub">Volume (leads) tegen kosten per order (of per R1 als er geen orderdata is). Rechtsonder = veel volume én efficiënt. Alleen kanalen met kostendata; volgt het gekozen attributiemodel.</p>
     <div class="chart-wrap tall"><canvas id="effChart"></canvas></div>
     <div class="legend-inline"><span>Bubbelgrootte = totale mediakosten · <b style="color:var(--good)">groen</b> = efficiënt · <b style="color:var(--red)">rood</b> = duur</span></div>
   </div>
@@ -1245,18 +1245,7 @@ function renderEffChart(){
   const card=document.getElementById('effCard');
   const ctx=document.getElementById('effChart');
   if(charts.eff) charts.eff.destroy();
-  // only meaningful on first-touch with cost data
-  if(COSTS.length===0 || state.attr!=='first'){
-    card.style.display = COSTS.length===0 ? 'none' : 'block';
-    if(COSTS.length && state.attr!=='first'){
-      const c=ctx.getContext('2d'); c.clearRect(0,0,ctx.width,ctx.height);
-      // show hint via chart area
-      charts.eff=new Chart(ctx,{type:'scatter',data:{datasets:[]},options:{
-        plugins:{legend:{display:false},title:{display:true,text:'Schakel naar first touch voor kosten-efficiëntie',color:'#8a8a94',font:{size:13}}},
-        scales:{x:{display:false},y:{display:false}}}});
-    }
-    return;
-  }
+  if(COSTS.length===0){ card.style.display='none'; return; }
   card.style.display='block';
   const useOrders = hasOrderData();
   const metricKey = useOrders ? 'cpo' : 'cpr1';
@@ -1342,14 +1331,14 @@ function renderTable(){
   });
   const maxLeads=Math.max(...data.map(d=>d.leads),1);
   const eur=v=> v==null ? '<span style="color:var(--ink-3)">n.v.t.</span>' : '€ '+fmt(Math.round(v));
-  const costForbidden = state.attr!=='first';
+  const isLast = state.attr!=='first';
   const showOrders = hasOrderData();
   const tb=document.querySelector('#channelTable tbody');
   tb.innerHTML=data.map(d=>{
-    const cpr1Cell= costForbidden ? '<span style="color:var(--ink-3)">—</span>' : eur(d.cpr1);
-    const cpoCell = costForbidden ? '<span style="color:var(--ink-3)">—</span>' : (showOrders? eur(d.cpo) : '<span style="color:var(--ink-3)">—</span>');
+    const cpr1Cell= eur(d.cpr1);
+    const cpoCell = showOrders? eur(d.cpo) : '<span style="color:var(--ink-3)">—</span>';
     let cpoStyle='';
-    if(!costForbidden && showOrders && d.cpo!=null){
+    if(showOrders && d.cpo!=null){
       if(d.cpo<1000) cpoStyle='color:var(--good);font-weight:700';
       else if(d.cpo>3000) cpoStyle='color:var(--red);font-weight:700';
     }
@@ -1372,10 +1361,11 @@ function renderTable(){
   if(COSTS.length===0){ note.style.display='none'; return; }
   note.style.display='block';
   const matched=totalMatchedCost(), unmatched=totalUnmatchedCost();
-  if(costForbidden){
-    note.innerHTML=`Kosten per lead/R1 worden alleen op <b>first-touch</b> getoond — daar is het advertentiebudget besteed dat de lead binnenhaalde. Schakel bovenin naar first touch.`;
+  const base = `Toewijsbare mediakosten in selectie: <b>€ ${fmt(Math.round(matched))}</b>. Daarnaast <b>€ ${fmt(Math.round(unmatched))}</b> aan niet-toewijsbare media die niet op leadniveau te koppelen is en dus buiten CPL/CPR1/CPO valt.`;
+  if(isLast){
+    note.innerHTML = `<b>Let op — last touch:</b> de kosten per kanaal blijven de werkelijke mediabesteding van dát kanaal, maar de R1's en orders zijn nu toegerekend aan het <b>afsluitende</b> touchpoint. Een kanaal dat vooral afsluit (bijv. Telefoon) krijgt zo veel conversies met weinig eigen media-inkoop, waardoor de CPO laag oogt; een kanaal dat vooral wérft (bijv. Google) krijgt zijn volledige kosten maar minder conversies, waardoor de CPO juist hoog oogt. Voor budgetbeslissingen is <b>first touch</b> doorgaans de eerlijkere basis. ${base}`;
   } else {
-    note.innerHTML=`Toewijsbare mediakosten in selectie: <b>€ ${fmt(Math.round(matched))}</b>. Daarnaast <b>€ ${fmt(Math.round(unmatched))}</b> aan niet-toewijsbare offline media (TV/radio, kranten, magazines) die niet op leadniveau te koppelen is en dus buiten CPL/CPR1 valt.`;
+    note.innerHTML = base;
   }
 }
 
