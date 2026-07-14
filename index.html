@@ -240,6 +240,25 @@
     <div class="note" id="costNote" style="border-left-color:var(--red)"></div>
   </div>
 
+  <div class="card pad" id="flCostCard" style="margin-bottom:16px">
+    <h2>First touch vs. last touch — CPO per kanaal</h2>
+    <p class="sub">Zelfde mediakosten, andere toerekening. Het verschil laat zien of een kanaal vooral <b>werft</b> (duurder op last touch: het brengt leads aan die elders afsluiten) of vooral <b>afsluit</b> (goedkoper op last touch: het rondt leads af die elders zijn geworven). Sorteerbaar; alleen kanalen met kostendata.</p>
+    <div style="overflow-x:auto">
+      <table id="flCostTable">
+        <thead><tr>
+          <th data-fl="channel">Kanaal</th>
+          <th data-fl="cost" class="num">Mediakosten</th>
+          <th data-fl="firstOrders" class="num">Orders (first)</th>
+          <th data-fl="firstCpo" class="num">CPO first touch</th>
+          <th data-fl="lastOrders" class="num">Orders (last)</th>
+          <th data-fl="lastCpo" class="num">CPO last touch</th>
+          <th data-fl="deltaPct" class="num">Verschil</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="card pad" style="margin-bottom:16px">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px">
       <div>
@@ -662,7 +681,7 @@ let MI_TOTAL = 0;                    // total touchpoint count (for KPI foot)
 let COSTS = [];                      // {ym, channel, cost}
 let COSTS_UNMATCHED = [];            // {ym, cost} — offline/non-attributable
 let charts = {};
-let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1, trendMetric: 'visit', trendChannels: null, cpoChannels: null };
+let state = { attr: 'first', type: 'all', cert: 'all', from: null, to: null, sortKey: 'leads', sortDir: -1, trendMetric: 'visit', trendChannels: null, cpoChannels: null, flSortKey: 'cost', flSortDir: -1 };
 
 const CERT_NAMES = ['exact','approx','single'];
 
@@ -879,6 +898,35 @@ function pathStats(){
   leads.forEach(r=>{ map[r.channel_path]=(map[r.channel_path]||0)+1; });
   const arr=Object.entries(map).map(([path,count])=>({path,count})).sort((a,b)=>b.count-a.count);
   return {arr:arr.slice(0,9), totalMulti:leads.length};
+}
+
+// Per channel: cost (same either way) + orders/R1 attributed on BOTH first and last touch.
+// Independent of state.attr, so the comparison table always shows both models.
+function firstLastCostCompare(){
+  const leads = filteredLeads();
+  const acc = {};   // ch -> counts on both models
+  const bump = (ch,k) => { acc[ch] = acc[ch] || {fLeads:0,fR1:0,fOrd:0,lLeads:0,lR1:0,lOrd:0}; acc[ch][k]++; };
+  leads.forEach(r=>{
+    const fc = r.first_touch_channel || 'Onbekend';
+    const lc = r.last_touch_channel  || 'Onbekend';
+    bump(fc,'fLeads'); if(r.converted) bump(fc,'fR1'); if(r.is_order) bump(fc,'fOrd');
+    bump(lc,'lLeads'); if(r.converted) bump(lc,'lR1'); if(r.is_order) bump(lc,'lOrd');
+  });
+  return Object.keys(acc).map(ch=>{
+    const a = acc[ch];
+    const cost = costForChannel(ch);   // null when channel has no cost data
+    const firstCpo = (cost!=null && a.fOrd) ? cost/a.fOrd : null;
+    const lastCpo  = (cost!=null && a.lOrd) ? cost/a.lOrd : null;
+    // delta: negative = cheaper on last touch (channel closes more than it wins)
+    let deltaPct = null;
+    if(firstCpo!=null && lastCpo!=null && firstCpo>0) deltaPct = (lastCpo-firstCpo)/firstCpo*100;
+    return {
+      channel:ch, cost,
+      firstLeads:a.fLeads, lastLeads:a.lLeads,
+      firstOrders:a.fOrd,  lastOrders:a.lOrd,
+      firstCpo, lastCpo, deltaPct,
+    };
+  }).filter(r=>r.cost!=null);   // CPO needs cost data
 }
 
 // Monthly CPO per channel: cost(month) / orders(leads whose first-touch month = that month).
@@ -1223,6 +1271,45 @@ function renderCpoTrend(){
   });
 }
 
+function renderFlCostTable(){
+  const card=document.getElementById('flCostCard');
+  if(!card) return;
+  if(COSTS.length===0 || !hasOrderData()){ card.style.display='none'; return; }
+  card.style.display='block';
+  let rows=firstLastCostCompare();
+  const k=state.flSortKey||'cost', dir=state.flSortDir||-1;
+  rows.sort((a,b)=>{
+    if(k==='channel') return dir*a.channel.localeCompare(b.channel);
+    const av=a[k], bv=b[k];
+    if(av==null && bv==null) return 0;
+    if(av==null) return 1; if(bv==null) return -1;
+    return dir*(av-bv);
+  });
+  const eur=v=> v==null ? '<span style="color:var(--ink-3)">n.v.t.</span>' : '€ '+fmt(Math.round(v));
+  const tb=document.querySelector('#flCostTable tbody');
+  tb.innerHTML=rows.map(r=>{
+    let deltaCell='<span style="color:var(--ink-3)">—</span>', label='';
+    if(r.deltaPct!=null){
+      const d=r.deltaPct;
+      // last cheaper than first => channel closes more than it wins
+      const closer = d < -10, winner = d > 10;
+      const col = closer ? 'var(--good)' : (winner ? 'var(--red)' : 'var(--ink-2)');
+      const sign = d>0?'+':'';
+      label = closer ? 'sluit af' : (winner ? 'werft' : 'neutraal');
+      deltaCell = `<b style="color:${col}">${sign}${fmt1(d)}%</b> <span style="color:var(--ink-3);font-size:11px">${label}</span>`;
+    }
+    return `
+    <tr>
+      <td><b>${r.channel}</b></td>
+      <td class="num">${eur(r.cost)}</td>
+      <td class="num">${fmt(r.firstOrders)}</td>
+      <td class="num">${eur(r.firstCpo)}</td>
+      <td class="num">${fmt(r.lastOrders)}</td>
+      <td class="num">${eur(r.lastCpo)}</td>
+      <td class="num">${deltaCell}</td>
+    </tr>`;}).join('');
+}
+
 function renderFlChart(){
   const {chans,f,l}=firstLastCompare();
   const ctx=document.getElementById('flChart');
@@ -1386,7 +1473,7 @@ function renderPaths(){
 function renderAll(){
   document.getElementById('perfModelLabel').textContent = state.attr==='first'?'first-touch':'last-touch';
   document.querySelectorAll('.modelLabel').forEach(e=>e.textContent=state.attr==='first'?'first-touch':'last-touch');
-  renderKpis(); renderChannelChart(); renderVolumeChart(); renderConvTrend(); renderCpoTrend(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderPaths();
+  renderKpis(); renderChannelChart(); renderVolumeChart(); renderConvTrend(); renderCpoTrend(); renderEffChart(); renderFunnelChart(); renderFlChart(); renderTable(); renderFlCostTable(); renderPaths();
 }
 
 function allMiDates(){
@@ -1424,6 +1511,13 @@ function bindEvents(){
       const k=th.dataset.sort;
       if(state.sortKey===k) state.sortDir*=-1; else {state.sortKey=k;state.sortDir=-1;}
       renderTable();
+    });
+  });
+  document.querySelectorAll('#flCostTable th[data-fl]').forEach(th=>{
+    th.addEventListener('click',()=>{
+      const k=th.dataset.fl;
+      if(state.flSortKey===k) state.flSortDir*=-1; else {state.flSortKey=k;state.flSortDir=-1;}
+      renderFlCostTable();
     });
   });
   // CSV upload
